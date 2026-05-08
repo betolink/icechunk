@@ -2323,6 +2323,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "http 1.4.0",
  "icechunk-macros",
  "icechunk-storage",
  "icechunk-types",

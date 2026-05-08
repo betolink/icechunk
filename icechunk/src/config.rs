@@ -38,6 +38,27 @@ pub use crate::storage::{
 #[cfg(feature = "object-store-gcs")]
 pub use icechunk_arrow_object_store::object_store::gcp::GcpCredential;
 
+/// Configuration for the HTTP(S) object store backend.
+///
+/// The `opts` field accepts `ClientConfigKey` names (in snake_case) as keys and is
+/// flattened in serde so that existing serialized configs that stored a plain
+/// `HashMap<String, String>` continue to deserialise correctly.
+///
+/// The `headers` field carries static HTTP headers that are injected into every
+/// request made by the underlying HTTP client (e.g. `"authorization": "Bearer …"`).
+/// Header values are **not** included in `Debug`/`Display` output to avoid leaking
+/// credentials in logs.
+#[cfg(feature = "object-store-http")]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HttpConfig {
+    /// Generic transport options (`ClientConfigKey` names → values).
+    #[serde(default, flatten)]
+    pub opts: HashMap<String, String>,
+    /// Static HTTP headers injected into every request.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
+}
+
 /// Storage backend configuration.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -46,7 +67,7 @@ pub enum ObjectStoreConfig {
     #[cfg(feature = "object-store-fs")]
     LocalFileSystem(PathBuf),
     #[cfg(feature = "object-store-http")]
-    Http(HashMap<String, String>),
+    Http(HttpConfig),
     S3Compatible(S3Options),
     S3(S3Options),
     #[cfg(feature = "object-store-gcs")]

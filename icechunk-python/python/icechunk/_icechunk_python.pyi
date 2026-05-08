@@ -243,7 +243,9 @@ class ObjectStoreConfig:
 
     class Http:
         def __new__(
-            cls, opts: Mapping[str, str] | None = None
+            cls,
+            opts: Mapping[str, str] | None = None,
+            headers: Mapping[str, str] | None = None,
         ) -> ObjectStoreConfig.Http: ...
         def __repr__(self) -> str: ...
         def __str__(self) -> str: ...
@@ -3094,6 +3096,7 @@ class Storage:
         cls,
         base_url: str,
         config: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> Storage: ...
     @classmethod
     def new_redirect(

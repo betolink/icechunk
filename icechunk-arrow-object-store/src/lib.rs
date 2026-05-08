@@ -11,6 +11,8 @@ use futures::{
     Stream, StreamExt as _, TryStreamExt as _,
     stream::{self, BoxStream},
 };
+#[cfg(feature = "http")]
+use http::header::HeaderName;
 #[cfg(feature = "s3")]
 use icechunk_storage::s3_config::{S3Credentials, S3Options};
 use icechunk_storage::strip_quotes;
@@ -42,6 +44,8 @@ use object_store::{
 };
 #[cfg(any(feature = "s3", feature = "gcs", feature = "azure", feature = "http"))]
 use object_store::{BackoffConfig, RetryConfig};
+#[cfg(feature = "http")]
+use object_store::{ClientOptions, HeaderMap, HeaderValue};
 #[cfg(any(feature = "gcs", feature = "azure"))]
 use object_store::{CredentialProvider, StaticCredentialProvider};
 use serde::{Deserialize, Serialize};
@@ -254,8 +258,10 @@ impl ObjectStorage {
     pub fn new_http(
         url: &Url,
         config: Option<HashMap<ClientConfigKey, String>>,
+        headers: Option<HashMap<String, String>>,
     ) -> Result<ObjectStorage, StorageError> {
-        let backend = Arc::new(HttpObjectStoreBackend { url: url.to_string(), config });
+        let backend =
+            Arc::new(HttpObjectStoreBackend { url: url.to_string(), config, headers });
         let storage = ObjectStorage { backend, client: OnceCell::new() };
         Ok(storage)
     }
@@ -758,23 +764,34 @@ impl ObjectStoreBackend for LocalFileSystemObjectStoreBackend {
 pub struct HttpObjectStoreBackend {
     pub url: String,
     pub config: Option<HashMap<ClientConfigKey, String>>,
+    /// Static HTTP headers injected into every request.
+    /// Values are redacted in `Display` output to avoid leaking credentials in logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
 }
 
 #[cfg(feature = "http")]
 impl Display for HttpObjectStoreBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let config_str = self
+            .config
+            .as_ref()
+            .map(|c| {
+                c.iter().map(|(k, v)| format!("{k:?}={v}")).collect::<Vec<_>>().join(", ")
+            })
+            .unwrap_or_else(|| "None".to_string());
+        // Header values are redacted to avoid leaking credentials in logs.
+        let headers_str = self
+            .headers
+            .as_ref()
+            .map(|h| {
+                h.keys().map(|k| format!("{k}=<redacted>")).collect::<Vec<_>>().join(", ")
+            })
+            .unwrap_or_else(|| "None".to_string());
         write!(
             f,
-            "HttpObjectStoreBackend(url={}, config={})",
-            self.url,
-            self.config
-                .as_ref()
-                .map(|c| c
-                    .iter()
-                    .map(|(k, v)| format!("{k:?}={v}"))
-                    .collect::<Vec<_>>()
-                    .join(", "))
-                .unwrap_or("None".to_string())
+            "HttpObjectStoreBackend(url={}, config={}, headers=[{}])",
+            self.url, config_str, headers_str
         )
     }
 }
@@ -806,6 +823,32 @@ impl ObjectStoreBackend for HttpObjectStoreBackend {
             && self.url.starts_with("http:")
         {
             builder = builder.with_config(ClientConfigKey::AllowHttp, "true");
+        }
+
+        // Inject static headers via ClientOptions so they are sent on every request.
+        // Note: if the URL is plain HTTP we must also carry allow_http=true into the
+        // ClientOptions to avoid overriding the AllowHttp flag set above.
+        if let Some(hdrs) = &self.headers {
+            if !hdrs.is_empty() {
+                let mut header_map = HeaderMap::new();
+                for (k, v) in hdrs {
+                    let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
+                        other_error(format!("invalid HTTP header name {k:?}: {e}"))
+                    })?;
+                    let value = HeaderValue::from_str(v).map_err(|e| {
+                        other_error(format!("invalid HTTP header value for {k:?}: {e}"))
+                    })?;
+                    header_map.insert(name, value);
+                }
+                let mut client_opts =
+                    ClientOptions::new().with_default_headers(header_map);
+                if !config.contains_key(&ClientConfigKey::AllowHttp)
+                    && self.url.starts_with("http:")
+                {
+                    client_opts = client_opts.with_allow_http(true);
+                }
+                builder = builder.with_client_options(client_opts);
+            }
         }
 
         let builder = builder.with_retry(RetryConfig {
@@ -1380,6 +1423,7 @@ pub async fn new_local_filesystem_storage(
 pub fn new_http_storage(
     base_url: &str,
     config: Option<HashMap<String, String>>,
+    headers: Option<HashMap<String, String>>,
 ) -> StorageResult<Arc<dyn Storage + Send + Sync>> {
     use std::str::FromStr as _;
     let base_url = Url::parse(base_url)
@@ -1395,7 +1439,7 @@ pub fn new_http_storage(
             ClientConfigKey::from_str(k).ok().map(|key| (key, v.clone()))
         })
         .collect();
-    let st = ObjectStorage::new_http(&base_url, Some(config))?;
+    let st = ObjectStorage::new_http(&base_url, Some(config), headers)?;
     Ok(Arc::new(st))
 }
 
