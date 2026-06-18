@@ -67,7 +67,7 @@ impl From<&VersionInfo> for JsStorageVersionInfo {
 
 /// Result of a get_object_range call from JS
 #[napi(object, js_name = "StorageGetObjectResponse")]
-pub struct JsStorageGetObjectResponse {
+pub(crate) struct JsStorageGetObjectResponse {
     pub data: Buffer,
     pub version: JsStorageVersionInfo,
 }
@@ -75,7 +75,7 @@ pub struct JsStorageGetObjectResponse {
 /// Result of a put_object or copy_object call from JS
 #[napi(object, js_name = "StorageVersionedUpdateResult")]
 #[derive(Clone, Debug)]
-pub struct JsStorageVersionedUpdateResult {
+pub(crate) struct JsStorageVersionedUpdateResult {
     /// "updated" or "not_on_latest_version"
     pub kind: String,
     pub new_version: Option<JsStorageVersionInfo>,
@@ -106,7 +106,7 @@ impl JsStorageVersionedUpdateResult {
 /// Result of a delete_batch call from JS
 #[napi(object, js_name = "StorageDeleteObjectsResult")]
 #[derive(Clone, Debug)]
-pub struct JsStorageDeleteObjectsResult {
+pub(crate) struct JsStorageDeleteObjectsResult {
     pub deleted_objects: f64,
     pub deleted_bytes: f64,
 }
@@ -114,7 +114,7 @@ pub struct JsStorageDeleteObjectsResult {
 /// Entry in a list_objects result from JS
 #[napi(object, js_name = "StorageListInfo")]
 #[derive(Clone, Debug)]
-pub struct JsStorageListInfo {
+pub(crate) struct JsStorageListInfo {
     pub id: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub size_bytes: f64,
@@ -123,7 +123,7 @@ pub struct JsStorageListInfo {
 /// Arguments for get_object_range callback
 #[napi(object, js_name = "StorageGetObjectRangeArgs")]
 #[derive(Clone, Debug)]
-pub struct JsStorageGetObjectRangeArgs {
+pub(crate) struct JsStorageGetObjectRangeArgs {
     pub path: String,
     pub range_start: Option<f64>,
     pub range_end: Option<f64>,
@@ -132,14 +132,14 @@ pub struct JsStorageGetObjectRangeArgs {
 /// A key-value pair for object metadata
 #[napi(object, js_name = "StorageKeyValue")]
 #[derive(Clone, Debug)]
-pub struct JsStorageKeyValue {
+pub(crate) struct JsStorageKeyValue {
     pub key: String,
     pub value: String,
 }
 
 /// Arguments for put_object callback
 #[napi(object, js_name = "StoragePutObjectArgs")]
-pub struct JsStoragePutObjectArgs {
+pub(crate) struct JsStoragePutObjectArgs {
     pub path: String,
     pub data: Buffer,
     pub content_type: Option<String>,
@@ -150,7 +150,7 @@ pub struct JsStoragePutObjectArgs {
 /// Arguments for copy_object callback
 #[napi(object, js_name = "StorageCopyObjectArgs")]
 #[derive(Clone, Debug)]
-pub struct JsStorageCopyObjectArgs {
+pub(crate) struct JsStorageCopyObjectArgs {
     pub from: String,
     pub to: String,
     pub content_type: Option<String>,
@@ -160,7 +160,7 @@ pub struct JsStorageCopyObjectArgs {
 /// An item in a delete_batch call
 #[napi(object, js_name = "StorageDeleteItem")]
 #[derive(Clone, Debug)]
-pub struct JsStorageDeleteItem {
+pub(crate) struct JsStorageDeleteItem {
     pub id: String,
     pub size: f64,
 }
@@ -168,7 +168,7 @@ pub struct JsStorageDeleteItem {
 /// Arguments for delete_batch callback
 #[napi(object, js_name = "StorageDeleteBatchArgs")]
 #[derive(Clone, Debug)]
-pub struct JsStorageDeleteBatchArgs {
+pub(crate) struct JsStorageDeleteBatchArgs {
     pub prefix: String,
     pub batch: Vec<JsStorageDeleteItem>,
 }
@@ -176,14 +176,14 @@ pub struct JsStorageDeleteBatchArgs {
 /// Arguments for get_object_conditional callback
 #[napi(object, js_name = "StorageGetObjectConditionalArgs")]
 #[derive(Clone, Debug)]
-pub struct JsStorageGetObjectConditionalArgs {
+pub(crate) struct JsStorageGetObjectConditionalArgs {
     pub path: String,
     pub previous_version: Option<JsStorageVersionInfo>,
 }
 
 /// Result of a get_object_conditional call from JS
 #[napi(object, js_name = "StorageGetModifiedResult")]
-pub struct JsStorageGetModifiedResult {
+pub(crate) struct JsStorageGetModifiedResult {
     /// "modified" or "on_latest_version"
     pub kind: String,
     pub data: Option<Buffer>,
@@ -542,15 +542,21 @@ mod native {
 
     impl From<JsS3Options> for icechunk::config::S3Options {
         fn from(opts: JsS3Options) -> Self {
-            icechunk::config::S3Options {
-                region: opts.region,
-                endpoint_url: opts.endpoint_url,
-                allow_http: opts.allow_http.unwrap_or(false),
-                anonymous: opts.anonymous.unwrap_or(false),
-                force_path_style: opts.force_path_style.unwrap_or(false),
-                network_stream_timeout_seconds: opts.network_stream_timeout_seconds,
-                requester_pays: opts.requester_pays.unwrap_or(false),
+            let mut s3 = icechunk::config::S3Options::default()
+                .with_allow_http(opts.allow_http.unwrap_or(false))
+                .with_anonymous(opts.anonymous.unwrap_or(false))
+                .with_force_path_style(opts.force_path_style.unwrap_or(false))
+                .with_requester_pays(opts.requester_pays.unwrap_or(false));
+            if let Some(region) = opts.region {
+                s3 = s3.with_region(region);
             }
+            if let Some(endpoint_url) = opts.endpoint_url {
+                s3 = s3.with_endpoint_url(endpoint_url);
+            }
+            if let Some(seconds) = opts.network_stream_timeout_seconds {
+                s3 = s3.with_network_stream_timeout_seconds(seconds);
+            }
+            s3
         }
     }
 
@@ -652,6 +658,7 @@ mod native {
     /// Azure credentials
     #[napi(js_name = "AzureCredentials")]
     pub enum JsAzureCredentials {
+        Anonymous,
         FromEnv,
         Static(JsAzureStaticCredentials),
     }
@@ -660,6 +667,7 @@ mod native {
         fn from(creds: JsAzureCredentials) -> Self {
             use icechunk::config::AzureCredentials;
             match creds {
+                JsAzureCredentials::Anonymous => AzureCredentials::Anonymous,
                 JsAzureCredentials::FromEnv => AzureCredentials::FromEnv,
                 JsAzureCredentials::Static(c) => AzureCredentials::Static(c.into()),
             }
@@ -942,15 +950,7 @@ impl JsStorage {
 
 #[cfg(not(target_family = "wasm"))]
 fn default_s3_options() -> icechunk::config::S3Options {
-    icechunk::config::S3Options {
-        region: None,
-        endpoint_url: None,
-        allow_http: false,
-        anonymous: false,
-        force_path_style: false,
-        network_stream_timeout_seconds: None,
-        requester_pays: false,
-    }
+    icechunk::config::S3Options::default()
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -973,15 +973,7 @@ impl JsStorage {
         options: Option<JsS3Options>,
     ) -> napi::Result<JsStorage> {
         let creds = credentials.map(|c| c.into());
-        let opts = options.map(|o| o.into()).unwrap_or(icechunk::config::S3Options {
-            region: None,
-            endpoint_url: None,
-            allow_http: false,
-            anonymous: false,
-            force_path_style: false,
-            network_stream_timeout_seconds: None,
-            requester_pays: false,
-        });
+        let opts = options.map(|o| o.into()).unwrap_or_default();
         let storage = icechunk::storage::new_s3_storage(opts, bucket, prefix, creds)
             .map_napi_err()?;
         Ok(JsStorage(storage))
@@ -996,15 +988,7 @@ impl JsStorage {
         options: Option<JsS3Options>,
     ) -> napi::Result<JsStorage> {
         let creds = credentials.map(|c| c.into());
-        let opts = options.map(|o| o.into()).unwrap_or(icechunk::config::S3Options {
-            region: None,
-            endpoint_url: None,
-            allow_http: false,
-            anonymous: false,
-            force_path_style: false,
-            network_stream_timeout_seconds: None,
-            requester_pays: false,
-        });
+        let opts = options.map(|o| o.into()).unwrap_or_default();
         let storage =
             icechunk::storage::new_r2_storage(opts, bucket, prefix, account_id, creds)
                 .map_napi_err()?;
@@ -1020,15 +1004,7 @@ impl JsStorage {
         use_weak_consistency: Option<bool>,
     ) -> napi::Result<JsStorage> {
         let creds = credentials.map(|c| c.into());
-        let opts = options.map(|o| o.into()).unwrap_or(icechunk::config::S3Options {
-            region: None,
-            endpoint_url: None,
-            allow_http: false,
-            anonymous: false,
-            force_path_style: false,
-            network_stream_timeout_seconds: None,
-            requester_pays: false,
-        });
+        let opts = options.map(|o| o.into()).unwrap_or_default();
         let weak_consistency = use_weak_consistency.unwrap_or(false);
         let storage = icechunk::storage::new_tigris_storage(
             opts,
@@ -1049,15 +1025,7 @@ impl JsStorage {
         options: Option<JsS3Options>,
     ) -> napi::Result<JsStorage> {
         let creds = credentials.map(|c| c.into());
-        let opts = options.map(|o| o.into()).unwrap_or(icechunk::config::S3Options {
-            region: None,
-            endpoint_url: None,
-            allow_http: false,
-            anonymous: false,
-            force_path_style: false,
-            network_stream_timeout_seconds: None,
-            requester_pays: false,
-        });
+        let opts = options.map(|o| o.into()).unwrap_or_default();
         let storage =
             icechunk::storage::new_s3_object_store_storage(opts, bucket, prefix, creds)
                 .await

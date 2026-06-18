@@ -53,15 +53,11 @@ async fn mk_s3_storage(
     let (access_key_id, secret_access_key) = permission.keys();
 
     let storage: Arc<dyn Storage + Send + Sync> = new_s3_storage(
-        S3Options {
-            region: Some("us-east-1".to_string()),
-            endpoint_url: Some("http://localhost:4200".to_string()),
-            allow_http: true,
-            anonymous: false,
-            force_path_style: true,
-            network_stream_timeout_seconds: None,
-            requester_pays: false,
-        },
+        S3Options::default()
+            .with_region("us-east-1")
+            .with_endpoint_url("http://localhost:4200")
+            .with_allow_http(true)
+            .with_force_path_style(true),
         "testbucket".to_string(),
         Some(prefix.to_string()),
         Some(S3Credentials::Static(S3StaticCredentials {
@@ -92,15 +88,13 @@ async fn mk_s3_object_store_storage(
                 session_token: None,
                 expires_after: None,
             })),
-            Some(S3Options {
-                region: Some("us-east-1".to_string()),
-                endpoint_url: Some("http://localhost:4200".to_string()),
-                allow_http: true,
-                anonymous: false,
-                force_path_style: true,
-                network_stream_timeout_seconds: None,
-                requester_pays: false,
-            }),
+            Some(
+                S3Options::default()
+                    .with_region("us-east-1")
+                    .with_endpoint_url("http://localhost:4200")
+                    .with_allow_http(true)
+                    .with_force_path_style(true),
+            ),
         )
         .await?,
     );
@@ -177,7 +171,9 @@ where
         ("azure_blob_slash", s4slash),
     ];
 
-    if env::var("AWS_BUCKET").is_ok() {
+    if let Ok(e) = env::var("AWS_BUCKET")
+        && !e.is_empty()
+    {
         let prefix = common::get_random_prefix("with_storage");
         let s = common::make_aws_integration_storage(prefix.clone())?;
         storages.push(("AWS", s));
@@ -186,7 +182,9 @@ where
         let s = common::make_aws_integration_storage(prefix.clone())?;
         storages.push(("AWS_slash", s));
     }
-    if env::var("R2_BUCKET").is_ok() {
+    if let Ok(e) = env::var("R2_BUCKET")
+        && !e.is_empty()
+    {
         let prefix = common::get_random_prefix("with_storage");
         let s = common::make_r2_integration_storage(prefix.clone())?;
         storages.push(("R2", s));
@@ -195,7 +193,7 @@ where
         let s = common::make_r2_integration_storage(prefix.clone())?;
         storages.push(("R2_slash", s));
     }
-    // if env::var("TIGRIS_BUCKET").is_ok() {
+    // if let Ok(e) = env::var("TIGRIS_BUCKET") && !e.is_empty() {
     //     let prefix = common::get_random_prefix("with_storage");
     //     let s = common::make_tigris_integration_storage(prefix.clone())?;
     //     storages.push(("Tigris", s));
@@ -223,7 +221,7 @@ async fn async_read_to_bytes(
 }
 
 #[tokio_test]
-pub async fn test_object_write_read() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_object_write_read() -> Result<(), Box<dyn std::error::Error>> {
     with_storage(Permission::Modify, |_, storage| async move {
         let storage_settings = storage.default_settings().await?;
         let id = SnapshotId::random();
@@ -279,7 +277,7 @@ pub async fn test_object_write_read() -> Result<(), Box<dyn std::error::Error>> 
 
 #[tokio_test]
 #[apply(spec_version_cases)]
-pub async fn test_tag_write_get(
+async fn test_tag_write_get(
     #[case] spec_version: SpecVersionBin,
 ) -> Result<(), Box<dyn std::error::Error>> {
     with_storage(Permission::Modify, |_, storage| async move {
@@ -302,7 +300,7 @@ pub async fn test_tag_write_get(
 
 #[tokio_test]
 #[apply(spec_version_cases)]
-pub async fn test_fetch_non_existing_tag(
+async fn test_fetch_non_existing_tag(
     #[case] spec_version: SpecVersionBin,
 ) -> Result<(), Box<dyn std::error::Error>> {
     with_storage(Permission::Modify, |_, storage| async move {
@@ -325,7 +323,7 @@ pub async fn test_fetch_non_existing_tag(
 
 #[tokio_test]
 #[apply(spec_version_cases)]
-pub async fn test_create_existing_tag(
+async fn test_create_existing_tag(
     #[case] spec_version: SpecVersionBin,
 ) -> Result<(), Box<dyn std::error::Error>> {
     with_storage(Permission::Modify, |_, storage| async move {
@@ -346,7 +344,7 @@ pub async fn test_create_existing_tag(
 }
 
 #[tokio_test]
-pub async fn check_clean_repo() -> Result<(), Box<dyn std::error::Error>> {
+async fn check_clean_repo() -> Result<(), Box<dyn std::error::Error>> {
     with_storage(Permission::Modify, |_, storage| async move {
         let _repo = Repository::create(
             None,
@@ -390,7 +388,7 @@ pub async fn check_clean_repo() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio_test]
-pub async fn test_list_objects() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_list_objects() -> Result<(), Box<dyn std::error::Error>> {
     with_storage(Permission::Modify, |_, storage| async move {
         let settings = storage.default_settings().await?;
         storage
@@ -490,7 +488,7 @@ pub async fn test_list_objects() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio_test]
-pub async fn test_delete_objects() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_delete_objects() -> Result<(), Box<dyn std::error::Error>> {
     with_storage(Permission::Modify, |_, storage| async move {
         let settings = storage.default_settings().await?;
         storage
@@ -592,7 +590,7 @@ pub async fn test_delete_objects() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio_test]
 #[apply(spec_version_cases)]
-pub async fn test_fetch_non_existing_branch(
+async fn test_fetch_non_existing_branch(
     #[case] spec_version: SpecVersionBin,
 ) -> Result<(), Box<dyn std::error::Error>> {
     with_storage(Permission::Modify, |_, storage| async move {
@@ -613,7 +611,7 @@ pub async fn test_fetch_non_existing_branch(
 
 #[tokio_test]
 #[apply(spec_version_cases)]
-pub async fn test_write_config_on_empty(
+async fn test_write_config_on_empty(
     #[case] spec_version: SpecVersionBin,
 ) -> Result<(), Box<dyn std::error::Error>> {
     with_storage(Permission::Modify, |_, storage| async move {
@@ -649,7 +647,7 @@ pub async fn test_write_config_on_empty(
 
 #[tokio_test]
 #[apply(spec_version_cases)]
-pub async fn test_write_config_on_existing(
+async fn test_write_config_on_existing(
     #[case] spec_version: SpecVersionBin,
 ) -> Result<(), Box<dyn std::error::Error>> {
     with_storage(Permission::Modify, |_, storage| async move {
@@ -685,7 +683,7 @@ pub async fn test_write_config_on_existing(
 
 #[tokio_test]
 #[apply(spec_version_cases)]
-pub async fn test_write_config_fails_on_bad_version_when_non_existing(
+async fn test_write_config_fails_on_bad_version_when_non_existing(
     #[case] spec_version: SpecVersionBin,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // FIXME: this test fails in MinIO but seems to work on S3
@@ -718,7 +716,7 @@ pub async fn test_write_config_fails_on_bad_version_when_non_existing(
 
 #[tokio_test]
 #[apply(spec_version_cases)]
-pub async fn test_write_config_fails_on_bad_version_when_existing(
+async fn test_write_config_fails_on_bad_version_when_existing(
     #[case] spec_version: SpecVersionBin,
 ) -> Result<(), Box<dyn std::error::Error>> {
     with_storage(Permission::Modify, |storage_type, storage| async move {
@@ -772,7 +770,7 @@ pub async fn test_write_config_fails_on_bad_version_when_existing(
 
 #[tokio_test]
 #[apply(spec_version_cases)]
-pub async fn test_write_config_can_overwrite_with_unsafe_config(
+async fn test_write_config_can_overwrite_with_unsafe_config(
     #[case] spec_version: SpecVersionBin,
 ) -> Result<(), Box<dyn std::error::Error>> {
     with_storage(Permission::Modify, |_, storage| async move {
@@ -815,8 +813,11 @@ pub async fn test_write_config_can_overwrite_with_unsafe_config(
 }
 
 #[tokio_test]
-pub async fn test_storage_classes() -> Result<(), Box<dyn std::error::Error>> {
-    if env::var("AWS_BUCKET").is_err() {
+async fn test_storage_classes() -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(e) = env::var("AWS_BUCKET")
+        && !e.is_empty()
+    {
+    } else {
         return Ok(());
     }
     let prefix = common::get_random_prefix("test_storage_classes");
@@ -929,7 +930,7 @@ async fn test_write_object_larger_than_multipart_threshold()
 }
 
 #[tokio_test]
-pub async fn test_get_object_conditional() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_get_object_conditional() -> Result<(), Box<dyn std::error::Error>> {
     with_storage(Permission::Modify, |_, storage| async move {
         let storage_settings = storage.default_settings().await?;
         let id = SnapshotId::random();
@@ -1156,7 +1157,7 @@ async fn test_redirect_storage() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio_test]
 #[apply(spec_version_cases)]
-pub async fn test_basic_repo_ops(
+async fn test_basic_repo_ops(
     #[case] spec_version: SpecVersionBin,
 ) -> Result<(), Box<dyn std::error::Error>> {
     with_storage(Permission::Modify, |_, storage| async move {

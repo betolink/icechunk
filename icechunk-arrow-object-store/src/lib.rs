@@ -52,7 +52,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fmt::{self, Debug, Display},
-    fs::create_dir_all,
     future::ready,
     num::{NonZeroU16, NonZeroU64},
     ops::Range,
@@ -166,6 +165,7 @@ pub trait AzureCredentialsFetcher: Debug + Sync + Send {
 #[serde(rename_all = "snake_case")]
 pub enum AzureCredentials {
     FromEnv,
+    Anonymous,
     Static(AzureStaticCredentials),
     Refreshable(Arc<dyn AzureCredentialsFetcher>),
 }
@@ -270,15 +270,12 @@ impl ObjectStorage {
     /// client is not serializeable and must be initialized after deserialization. Under normal construction
     /// the original client is returned immediately.
     #[instrument(skip_all)]
-    async fn get_client(&self, settings: &Settings) -> &Arc<dyn ObjectStore> {
+    async fn get_client(
+        &self,
+        settings: &Settings,
+    ) -> StorageResult<&Arc<dyn ObjectStore>> {
         self.client
-            .get_or_init(|| async {
-                // TODO: handle error better?
-                #[expect(clippy::expect_used)]
-                self.backend
-                    .mk_object_store(settings)
-                    .expect("failed to create object store")
-            })
+            .get_or_try_init(|| async { self.backend.mk_object_store(settings) })
             .await
     }
 
@@ -293,7 +290,7 @@ impl ObjectStorage {
     /// Intended for testing and debugging purposes only.
     pub async fn all_keys(&self) -> StorageResult<Vec<String>> {
         self.get_client(&self.backend.default_settings())
-            .await
+            .await?
             .list(None)
             .map_ok(|obj| obj.location.to_string())
             .try_collect()
@@ -368,6 +365,10 @@ impl Storage for ObjectStorage {
         Ok(self.backend.can_write())
     }
 
+    async fn create_location_if_needed(&self) -> StorageResult<()> {
+        self.backend.create_location_if_needed()
+    }
+
     #[instrument(skip_all)]
     async fn default_settings(&self) -> StorageResult<Settings> {
         Ok(self.backend.default_settings())
@@ -400,7 +401,7 @@ impl Storage for ObjectStorage {
         let options = PutOptions { mode, attributes, ..PutOptions::default() };
         // FIXME: use multipart
         let res =
-            self.get_client(settings).await.put_opts(&path, bytes.into(), options).await;
+            self.get_client(settings).await?.put_opts(&path, bytes.into(), options).await;
         match res {
             Ok(res) => {
                 let new_version = VersionInfo {
@@ -437,7 +438,7 @@ impl Storage for ObjectStorage {
                 if_match: version.etag().map(|e| strip_quotes(e).into()),
                 ..Default::default()
             };
-            let result = self.get_client(settings).await.get_opts(&from, opts).await;
+            let result = self.get_client(settings).await?.get_opts(&from, opts).await;
             match result {
                 Ok(result) => {
                     let bytes = result
@@ -446,7 +447,7 @@ impl Storage for ObjectStorage {
                         .map_err(|e| StorageErrorKind::ObjectStore(Box::new(e)))
                         .capture()?;
                     self.get_client(settings)
-                        .await
+                        .await?
                         .put(&to, bytes.into())
                         .await
                         .map_err(|e| StorageErrorKind::ObjectStore(Box::new(e)))
@@ -460,7 +461,7 @@ impl Storage for ObjectStorage {
                 Err(err) => Err(obj_store_error(err)),
             }
         } else {
-            match self.get_client(settings).await.copy(&from, &to).await {
+            match self.get_client(settings).await?.copy(&from, &to).await {
                 Ok(_) => {
                     Ok(VersionedUpdateResult::Updated { new_version: version.clone() })
                 }
@@ -478,7 +479,7 @@ impl Storage for ObjectStorage {
     ) -> StorageResult<BoxStream<'a, StorageResult<ListInfo<String>>>> {
         let prefix = ObjectPath::from(format!("{}/{}", self.backend.prefix(), prefix));
         let stream =
-            self.get_client(settings).await.list(Some(&prefix)).map(move |object| {
+            self.get_client(settings).await?.list(Some(&prefix)).map(move |object| {
                 let prefix = prefix.clone();
                 object
                     .map_err(obj_store_error)
@@ -502,7 +503,7 @@ impl Storage for ObjectStorage {
             sizes.insert(path, size);
         }
         let results =
-            self.get_client(settings).await.delete_stream(stream::iter(ids).boxed());
+            self.get_client(settings).await?.delete_stream(stream::iter(ids).boxed());
         let res = results
             .fold(DeleteObjectsResult::default(), |mut res, delete_result| {
                 if let Ok(deleted_path) = delete_result {
@@ -531,7 +532,7 @@ impl Storage for ObjectStorage {
         let path = self.prefixed_path(path);
         let res = self
             .get_client(settings)
-            .await
+            .await?
             .head(&path)
             .await
             .map_err(Box::new)
@@ -604,7 +605,7 @@ impl ObjectStorage {
                 .and_then(|v| v.etag().map(|e| strip_quotes(e).into())),
             ..Default::default()
         };
-        let res = self.get_client(settings).await.get_opts(&full_key, opts).await;
+        let res = self.get_client(settings).await?.get_opts(&full_key, opts).await;
 
         match res {
             Ok(result) => {
@@ -645,6 +646,10 @@ pub trait ObjectStoreBackend: Debug + Display + Sync + Send {
 
     fn can_write(&self) -> bool {
         true
+    }
+
+    fn create_location_if_needed(&self) -> Result<(), StorageError> {
+        Ok(())
     }
 }
 
@@ -723,8 +728,13 @@ impl ObjectStoreBackend for LocalFileSystemObjectStoreBackend {
         &self,
         _settings: &Settings,
     ) -> Result<Arc<dyn ObjectStore>, StorageError> {
-        create_dir_all(&self.path).capture()?;
-        let path = std::fs::canonicalize(&self.path).capture()?;
+        let path = std::fs::canonicalize(&self.path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                StorageError::capture(StorageErrorKind::ObjectNotFound)
+            } else {
+                StorageError::capture(StorageErrorKind::IOError(err))
+            }
+        })?;
         let fs = LocalFileSystem::new_with_prefix(path).capture_box()?;
         Ok(Arc::new(fs))
     }
@@ -757,6 +767,11 @@ impl ObjectStoreBackend for LocalFileSystemObjectStoreBackend {
             ..Default::default()
         }
     }
+
+    fn create_location_if_needed(&self) -> Result<(), StorageError> {
+        std::fs::create_dir_all(&self.path).capture()?;
+        Ok(())
+    }
 }
 
 #[cfg(feature = "http")]
@@ -764,8 +779,6 @@ impl ObjectStoreBackend for LocalFileSystemObjectStoreBackend {
 pub struct HttpObjectStoreBackend {
     pub url: String,
     pub config: Option<HashMap<ClientConfigKey, String>>,
-    /// Static HTTP headers injected into every request.
-    /// Values are redacted in `Display` output to avoid leaking credentials in logs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
 }
@@ -780,7 +793,6 @@ impl Display for HttpObjectStoreBackend {
                 c.iter().map(|(k, v)| format!("{k:?}={v}")).collect::<Vec<_>>().join(", ")
             })
             .unwrap_or_else(|| "None".to_string());
-        // Header values are redacted to avoid leaking credentials in logs.
         let headers_str = self
             .headers
             .as_ref()
@@ -807,63 +819,58 @@ impl ObjectStoreBackend for HttpObjectStoreBackend {
         &self,
         settings: &Settings,
     ) -> Result<Arc<dyn ObjectStore>, StorageError> {
-        let builder = HttpBuilder::new()
-            .with_url(&self.url)
-            .with_config(ClientConfigKey::UserAgent, icechunk_types::user_agent());
-
         let empty = HashMap::new();
         let config = self.config.as_ref().unwrap_or(&empty);
 
-        // Add options (user config takes precedence over defaults)
-        let mut builder = config
+        // Build a single ClientOptions accumulating all settings so that
+        // with_client_options (which replaces, not merges) is called exactly once.
+        // Start with the icechunk UserAgent default; user-supplied opts applied
+        // after so they can override it if needed.
+        let mut client_opts = ClientOptions::new()
+            .with_config(ClientConfigKey::UserAgent, icechunk_types::user_agent());
+        client_opts = config
             .iter()
-            .fold(builder, |builder, (key, value)| builder.with_config(*key, value));
+            .fold(client_opts, |opts, (key, value)| opts.with_config(*key, value));
 
+        // Auto-enable AllowHttp for plain http:// URLs unless the user already set it.
         if !config.contains_key(&ClientConfigKey::AllowHttp)
             && self.url.starts_with("http:")
         {
-            builder = builder.with_config(ClientConfigKey::AllowHttp, "true");
+            client_opts = client_opts.with_allow_http(true);
         }
 
-        // Inject static headers via ClientOptions so they are sent on every request.
-        // Note: if the URL is plain HTTP we must also carry allow_http=true into the
-        // ClientOptions to avoid overriding the AllowHttp flag set above.
-        if let Some(hdrs) = &self.headers {
-            if !hdrs.is_empty() {
-                let mut header_map = HeaderMap::new();
-                for (k, v) in hdrs {
-                    let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
-                        other_error(format!("invalid HTTP header name {k:?}: {e}"))
-                    })?;
-                    let value = HeaderValue::from_str(v).map_err(|e| {
-                        other_error(format!("invalid HTTP header value for {k:?}: {e}"))
-                    })?;
-                    header_map.insert(name, value);
-                }
-                let mut client_opts =
-                    ClientOptions::new().with_default_headers(header_map);
-                if !config.contains_key(&ClientConfigKey::AllowHttp)
-                    && self.url.starts_with("http:")
-                {
-                    client_opts = client_opts.with_allow_http(true);
-                }
-                builder = builder.with_client_options(client_opts);
+        if let Some(hdrs) = &self.headers
+            && !hdrs.is_empty()
+        {
+            let mut header_map = HeaderMap::new();
+            for (k, v) in hdrs {
+                let name = k.parse::<HeaderName>().map_err(|e| {
+                    other_error(format!("invalid HTTP header name {k:?}: {e}"))
+                })?;
+                let value = HeaderValue::from_str(v).map_err(|e| {
+                    other_error(format!("invalid HTTP header value for {k:?}: {e}"))
+                })?;
+                header_map.insert(name, value);
             }
+            client_opts = client_opts.with_default_headers(header_map);
         }
 
-        let builder = builder.with_retry(RetryConfig {
-            backoff: BackoffConfig {
-                init_backoff: core::time::Duration::from_millis(
-                    settings.retries().initial_backoff_ms() as u64,
-                ),
-                max_backoff: core::time::Duration::from_millis(
-                    settings.retries().max_backoff_ms() as u64,
-                ),
-                base: 2.,
-            },
-            max_retries: settings.retries().max_tries().get() as usize - 1,
-            retry_timeout: core::time::Duration::from_secs(5 * 60),
-        });
+        let builder = HttpBuilder::new()
+            .with_url(&self.url)
+            .with_client_options(client_opts)
+            .with_retry(RetryConfig {
+                backoff: BackoffConfig {
+                    init_backoff: core::time::Duration::from_millis(
+                        settings.retries().initial_backoff_ms() as u64,
+                    ),
+                    max_backoff: core::time::Duration::from_millis(
+                        settings.retries().max_backoff_ms() as u64,
+                    ),
+                    base: 2.,
+                },
+                max_retries: settings.retries().max_tries().get() as usize - 1,
+                retry_timeout: core::time::Duration::from_secs(5 * 60),
+            });
 
         let store = builder.build().capture_box()?;
 
@@ -1056,6 +1063,7 @@ impl ObjectStoreBackend for AzureObjectStoreBackend {
                     AzureRefreshableCredentialProvider::new(Arc::clone(fetcher));
                 builder.with_credentials(Arc::new(credential_provider))
             }
+            Some(AzureCredentials::Anonymous) => builder.with_skip_signature(true),
             None | Some(AzureCredentials::FromEnv) => MicrosoftAzureBuilder::from_env(),
         };
 
@@ -1501,4 +1509,70 @@ pub fn new_gcs_storage(
         .collect();
     let storage = ObjectStorage::new_gcs(bucket, prefix, credentials, Some(config))?;
     Ok(Arc::new(storage))
+}
+
+#[cfg(all(test, feature = "http"))]
+mod http_tests {
+    use std::collections::HashMap;
+
+    use icechunk_storage::Settings;
+
+    use super::{HttpObjectStoreBackend, ObjectStoreBackend as _};
+
+    #[expect(clippy::expect_used, reason = "test helper, panicking on bad input is fine")]
+    fn backend(
+        opts: &[(&str, &str)],
+        headers: &[(&str, &str)],
+    ) -> HttpObjectStoreBackend {
+        let config = opts
+            .iter()
+            .map(|(k, v)| (k.parse().expect("valid ClientConfigKey"), (*v).to_string()))
+            .collect();
+        let headers = headers
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect::<HashMap<_, _>>();
+        HttpObjectStoreBackend {
+            url: "https://example.com/".to_string(),
+            config: Some(config),
+            headers: if headers.is_empty() { None } else { Some(headers) },
+        }
+    }
+
+    /// Store builds with opts only (no headers).
+    #[test]
+    fn test_mk_object_store_opts_only() {
+        let b = backend(&[("allow_http", "true")], &[]);
+        assert!(b.mk_object_store(&Settings::default()).is_ok());
+    }
+
+    /// Store builds with headers only (no opts).
+    #[test]
+    fn test_mk_object_store_headers_only() {
+        let b = backend(&[], &[("Authorization", "Bearer token123")]);
+        assert!(b.mk_object_store(&Settings::default()).is_ok());
+    }
+
+    /// Store builds when both opts and headers are present — the opts-clobber
+    /// bug would have caused `allow_http` to be silently dropped in this case.
+    #[test]
+    fn test_mk_object_store_opts_and_headers() {
+        let b =
+            backend(&[("allow_http", "true")], &[("Authorization", "Bearer token123")]);
+        assert!(b.mk_object_store(&Settings::default()).is_ok());
+    }
+
+    /// A header name containing a space is invalid and must return Err.
+    #[test]
+    fn test_mk_object_store_invalid_header_name() {
+        let b = backend(&[], &[("bad header", "value")]);
+        assert!(b.mk_object_store(&Settings::default()).is_err());
+    }
+
+    /// A header value containing a newline is invalid and must return Err.
+    #[test]
+    fn test_mk_object_store_invalid_header_value() {
+        let b = backend(&[], &[("X-Custom", "val\nue")]);
+        assert!(b.mk_object_store(&Settings::default()).is_err());
+    }
 }

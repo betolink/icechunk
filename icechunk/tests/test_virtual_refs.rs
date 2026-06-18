@@ -49,15 +49,11 @@ use pretty_assertions::assert_eq;
 fn spec_version_cases(#[case] spec_version: SpecVersionBin) {}
 
 fn minio_s3_config() -> (S3Options, S3Credentials) {
-    let config = S3Options {
-        region: Some("us-east-1".to_string()),
-        endpoint_url: Some("http://localhost:4200".to_string()),
-        allow_http: true,
-        anonymous: false,
-        force_path_style: true,
-        network_stream_timeout_seconds: None,
-        requester_pays: false,
-    };
+    let config = S3Options::default()
+        .with_region("us-east-1")
+        .with_endpoint_url("http://localhost:4200")
+        .with_allow_http(true)
+        .with_force_path_style(true);
     let credentials = S3Credentials::Static(S3StaticCredentials {
         access_key_id: "test123".into(),
         secret_access_key: "test123".into(),
@@ -124,28 +120,16 @@ async fn create_local_repository(
     let mut containers = vec![
         VirtualChunkContainer::new(
             "s3://testbucket/".to_string(),
-            ObjectStoreConfig::S3(S3Options {
-                region: Some("us-east-1".to_string()),
-                endpoint_url: None,
-                anonymous: true,
-                allow_http: false,
-                force_path_style: false,
-                network_stream_timeout_seconds: None,
-                requester_pays: false,
-            }),
+            ObjectStoreConfig::S3(
+                S3Options::default().with_region("us-east-1").with_anonymous(true),
+            ),
         )
         .unwrap(),
         VirtualChunkContainer::new(
             "s3://earthmover-sample-data/".to_string(),
-            ObjectStoreConfig::S3(S3Options {
-                region: Some("us-east-1".to_string()),
-                endpoint_url: None,
-                anonymous: true,
-                allow_http: false,
-                force_path_style: false,
-                network_stream_timeout_seconds: None,
-                requester_pays: false,
-            }),
+            ObjectStoreConfig::S3(
+                S3Options::default().with_region("us-east-1").with_anonymous(true),
+            ),
         )
         .unwrap(),
         VirtualChunkContainer::new(
@@ -168,6 +152,14 @@ async fn create_local_repository(
             ObjectStoreConfig::Gcs(Default::default()),
         )
         .unwrap(),
+        VirtualChunkContainer::new(
+            "az://sea-surface-temp-whoi/".to_string(),
+            ObjectStoreConfig::Azure(HashMap::from([(
+                "account".to_string(),
+                "noaacdr".to_string(),
+            )])),
+        )
+        .unwrap(),
     ];
 
     let mut creds: HashMap<_, Option<Credentials>> = [
@@ -185,6 +177,10 @@ async fn create_local_repository(
         (
             "gcs://gcp-public-data-arco-era5".to_string(),
             Some(Credentials::Gcs(GcsCredentials::Anonymous)),
+        ),
+        (
+            "az://sea-surface-temp-whoi".to_string(),
+            Some(Credentials::Azure(AzureCredentials::Anonymous)),
         ),
     ]
     .into();
@@ -214,28 +210,24 @@ async fn create_minio_repository(spec_version: SpecVersionBin) -> Repository {
     let containers = vec![
         VirtualChunkContainer::new(
             "s3://testbucket/".to_string(),
-            ObjectStoreConfig::S3Compatible(S3Options {
-                region: Some(String::from("us-east-1")),
-                endpoint_url: Some("http://localhost:4200".to_string()),
-                anonymous: false,
-                allow_http: true,
-                force_path_style: true,
-                network_stream_timeout_seconds: None,
-                requester_pays: false,
-            }),
+            ObjectStoreConfig::S3Compatible(
+                S3Options::default()
+                    .with_region("us-east-1")
+                    .with_endpoint_url("http://localhost:4200")
+                    .with_allow_http(true)
+                    .with_force_path_style(true),
+            ),
         )
         .unwrap(),
         VirtualChunkContainer::new(
             "s3://testbucket/path with spaces/".to_string(),
-            ObjectStoreConfig::S3Compatible(S3Options {
-                region: Some(String::from("us-east-1")),
-                endpoint_url: Some("http://localhost:4200".to_string()),
-                anonymous: false,
-                allow_http: true,
-                force_path_style: true,
-                network_stream_timeout_seconds: None,
-                requester_pays: false,
-            }),
+            ObjectStoreConfig::S3Compatible(
+                S3Options::default()
+                    .with_region("us-east-1")
+                    .with_endpoint_url("http://localhost:4200")
+                    .with_allow_http(true)
+                    .with_force_path_style(true),
+            ),
         )
         .unwrap(),
         VirtualChunkContainer::new(
@@ -836,6 +828,48 @@ async fn test_zarr_store_virtual_refs_from_public_gcs(
 
 #[tokio_test]
 #[apply(spec_version_cases)]
+async fn test_zarr_store_virtual_refs_from_public_azure(
+    #[case] spec_version: SpecVersionBin,
+) -> Result<(), Box<dyn Error>> {
+    let repo_dir = TempDir::new()?;
+    let repo = create_local_repository(repo_dir.path(), None, spec_version).await;
+    let ds = repo.writable_session("main").await.unwrap();
+
+    let store = Store::from_session(Arc::new(RwLock::new(ds))).await;
+
+    store
+        .set(
+            "zarr.json",
+            Bytes::copy_from_slice(br#"{"zarr_format":3, "node_type":"group"}"#),
+        )
+        .await
+        .unwrap();
+
+    let zarr_meta = Bytes::copy_from_slice(br#"{"zarr_format":3,"node_type":"array","attributes":{},"shape":[8],"data_type":"uint8","chunk_grid":{"name":"regular","configuration":{"chunk_shape":[8]}},"chunk_key_encoding":{"name":"default","configuration":{"separator":"/"}},"fill_value": 0,"codecs":[{"name":"mycodec","configuration":{"foo":42}}],"storage_transformers":[],"dimension_names":["x"]}"#);
+    store.set("magic/zarr.json", zarr_meta.clone()).await.unwrap();
+
+    // This is a permanent public dataset: the NOAA Sea Surface Temperature WHOI
+    // Climate Data Record, hosted anonymously on Azure Blob Storage. See
+    // https://planetarycomputer.microsoft.com/dataset/noaa-cdr-sea-surface-temperature-whoi
+    let public_ref = VirtualChunkRef {
+        location: VirtualChunkLocation::from_url(
+            "az://sea-surface-temp-whoi/data/1988/SEAFLUX-OSB-CDR_V02R00_SST_D19880101_C20160820.nc",
+        )?,
+        offset: 0,
+        length: 8,
+        checksum: None,
+    };
+
+    store.set_virtual_ref("magic/c/0", public_ref, false).await?;
+
+    let chunk = store.get("magic/c/0", &ByteRange::ALL).await.unwrap();
+    // The first 8 bytes of these netCDF4 files are the HDF5 magic signature.
+    assert_eq!(chunk.as_ref(), b"\x89HDF\r\n\x1a\n");
+    Ok(())
+}
+
+#[tokio_test]
+#[apply(spec_version_cases)]
 async fn test_zarr_store_with_multiple_virtual_chunk_containers(
     #[case] spec_version: SpecVersionBin,
 ) -> Result<(), Box<dyn Error>> {
@@ -853,15 +887,13 @@ async fn test_zarr_store_with_multiple_virtual_chunk_containers(
     let containers = vec![
         VirtualChunkContainer::new(
             "s3://testbucket/".to_string(),
-            ObjectStoreConfig::S3Compatible(S3Options {
-                region: Some(String::from("us-east-1")),
-                endpoint_url: Some("http://localhost:4200".to_string()),
-                anonymous: false,
-                allow_http: true,
-                force_path_style: true,
-                network_stream_timeout_seconds: None,
-                requester_pays: false,
-            }),
+            ObjectStoreConfig::S3Compatible(
+                S3Options::default()
+                    .with_region("us-east-1")
+                    .with_endpoint_url("http://localhost:4200")
+                    .with_allow_http(true)
+                    .with_force_path_style(true),
+            ),
         )
         .unwrap(),
         VirtualChunkContainer::new(
@@ -871,15 +903,9 @@ async fn test_zarr_store_with_multiple_virtual_chunk_containers(
         .unwrap(),
         VirtualChunkContainer::new(
             "s3://earthmover-sample-data/".to_string(),
-            ObjectStoreConfig::S3(S3Options {
-                region: Some(String::from("us-east-1")),
-                endpoint_url: None,
-                anonymous: true,
-                allow_http: false,
-                force_path_style: false,
-                network_stream_timeout_seconds: None,
-                requester_pays: false,
-            }),
+            ObjectStoreConfig::S3(
+                S3Options::default().with_region("us-east-1").with_anonymous(true),
+            ),
         )
         .unwrap(),
     ];

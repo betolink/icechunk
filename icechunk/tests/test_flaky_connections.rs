@@ -32,15 +32,12 @@ fn create_proxied_storage(
 ) -> Result<Arc<S3Storage>, Box<dyn std::error::Error>> {
     let (access_key_id, secret_access_key) = Permission::Modify.keys();
     let storage = S3Storage::new(
-        S3Options {
-            region: Some("us-east-1".to_string()),
-            endpoint_url: Some(format!("http://localhost:{proxy_port}")),
-            allow_http: true,
-            anonymous: false,
-            force_path_style: true,
-            network_stream_timeout_seconds: Some(timeout_seconds),
-            requester_pays: false,
-        },
+        S3Options::default()
+            .with_region("us-east-1")
+            .with_endpoint_url(format!("http://localhost:{proxy_port}"))
+            .with_allow_http(true)
+            .with_force_path_style(true)
+            .with_network_stream_timeout_seconds(timeout_seconds),
         "testbucket".to_string(),
         Some(format!("{}-{}", prefix, uuid::Uuid::new_v4())),
         S3Credentials::Static(S3StaticCredentials {
@@ -57,32 +54,37 @@ fn create_proxied_storage(
     Ok(Arc::new(storage))
 }
 
+/// Delete a proxy by name via the toxiproxy REST API, ignoring a 404.
+///
+/// We can't use `noxious_client` for this: its deserializer chokes on any proxy
+/// that has toxics attached (e.g. left behind by a crashed run), which is
+/// exactly the case we need to clean up. The raw REST endpoint doesn't
+/// deserialize toxics, so it always works.
+async fn delete_proxy_via_api(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("http://localhost:8474/proxies/{name}");
+    let resp = reqwest::Client::new().delete(&url).send().await?;
+    // 204 = deleted, 404 = wasn't there; both are fine.
+    if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NOT_FOUND {
+        let text = resp.text().await?;
+        return Err(format!("Failed to delete proxy {name}: {text}").into());
+    }
+    Ok(())
+}
+
 /// Set up toxiproxy: create a new proxy on the given port, return (client, `proxy_name`).
-/// If another proxy already holds the port (e.g. from a crashed test), it is
-/// deleted first. Each test deletes its own proxy on cleanup.
+/// Any existing proxy with the same name (e.g. left by a crashed test run) is
+/// deleted first so `create_proxy` can't 409. Each test deletes its own proxy
+/// on cleanup.
 async fn setup_toxiproxy(
     name: &str,
     port: u16,
 ) -> Result<(Client, String), Box<dyn std::error::Error>> {
     let client = Client::new("http://localhost:8474");
 
-    // Delete any proxy already bound to this port.
-    // This handles leftover proxies from crashed/aborted test runs without
-    // wiping unrelated proxies.
-    // Uncomment the block below to nuke all proxies during development:
-    // let proxies = client.proxies().await.unwrap_or_default();
-    // for (name, proxy) in proxies {
-    //     println!("   Deleting old proxy: {}", name);
-    //     proxy.delete().await.ok();
-    // }
-    let port_suffix = format!(":{port}");
-    let proxies = client.proxies().await.unwrap_or_default();
-    for (name, proxy) in proxies {
-        if proxy.config.listen.ends_with(&port_suffix) {
-            println!("Deleting stale proxy on :{port}: {name}");
-            let _ = proxy.delete().await;
-        }
-    }
+    // Delete by name before creating. This survives a crashed run that left a
+    // toxic-laden proxy — unlike scanning `client.proxies()`, whose deserializer
+    // fails on proxies that have toxics attached.
+    delete_proxy_via_api(name).await?;
 
     let listen = format!("0.0.0.0:{port}");
     let name = name.to_string();

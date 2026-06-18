@@ -113,6 +113,26 @@ pub enum SessionErrorKind {
     NonRearrangeSession,
     #[error("move cannot overwrite existing node at `{0}`")]
     MoveWontOverwrite(String),
+    #[error(
+        "cannot move `{from}` into itself or its own descendant `{to}`.\n\n\
+         This move would require `{from}` to be both an ancestor and a descendant of itself, which is impossible. \
+         If your intent is to nest `{from}`'s contents under a new group at `{to}`, create `{to}` as a new \
+         group yourself in a writable_session, then in a rearrange_session move each direct child of `{from}` \
+         to `{to}/<child_name>`. Note that `{from}`'s metadata is not carried over to `{to}` — copy any \
+         attributes you need to preserve onto the new group when you create it."
+    )]
+    MoveIntoSelfOrDescendant { from: Path, to: Path },
+    #[error(
+        "cannot move to `{to}`: the destination's parent group `{missing_parent}` does not exist. \
+         Icechunk's `move` never creates intermediate groups — create `{missing_parent}` in a writable_session \
+         and commit first, then retry the move in a rearrange_session."
+    )]
+    MoveDestinationParentMissing { to: Path, missing_parent: Path },
+    #[error(
+        "cannot move to `{to}`: the destination's parent `{parent}` is an array, not a group. \
+         Move destinations must land under groups; arrays cannot have children."
+    )]
+    MoveDestinationParentNotGroup { to: Path, parent: Path },
     #[error("snapshot not found: `{id}`")]
     SnapshotNotFound { id: SnapshotId },
     #[error("no ancestor node was found for `{prefix}`")]
@@ -146,6 +166,12 @@ pub enum SessionErrorKind {
     Conflict { expected_parent: Option<SnapshotId>, actual_parent: Option<SnapshotId> },
     #[error("cannot rebase snapshot {snapshot} on top of the branch")]
     RebaseFailed { snapshot: SnapshotId, conflicts: Vec<Conflict> },
+    #[error(
+        "cannot rebase: transaction log {tx_log} of an expiration-pruned ancestor of \
+         {snapshot} is missing (likely deleted by an older Icechunk GC), so conflicts \
+         against it cannot be checked"
+    )]
+    MissingPrunedAncestorTxLog { snapshot: SnapshotId, tx_log: SnapshotId },
     #[error("error in serializing config to JSON")]
     JsonSerializationError(#[from] serde_json::Error),
     #[error("error in session serialization")]
@@ -796,6 +822,14 @@ impl Session {
         self.asset_manager.fail_unless_spec_at_least(SpecVersionBin::V2).inject()?;
         // does the source node exist?
         let node = self.get_node(&from).await?;
+        // self-referential move: to == from or to is a descendant of from.
+        // `Path::starts_with` is component-based and returns false for equal
+        // absolute paths, so check equality explicitly.
+        if to == from || to.starts_with(&from) {
+            return Err(SessionError::capture(
+                SessionErrorKind::MoveIntoSelfOrDescendant { from, to },
+            ));
+        }
         // are we overwriting the destination node?
         if (self.get_node(&to).await).is_ok() {
             return Err(SessionError::capture(SessionErrorKind::MoveWontOverwrite(
@@ -803,8 +837,30 @@ impl Session {
             )));
         }
 
-        // verify all parent nodes in "to" path exist
-        self.check_all_ancestors_exist(&to).await?;
+        // destination's immediate parent must exist and be a group. Deeper
+        // ancestors are guaranteed groups when the immediate parent is one
+        // (the tree is well-formed).
+        if let Some(parent) = to.parent() {
+            match self.get_node(&parent).await {
+                Ok(NodeSnapshot { node_data: NodeData::Array { .. }, .. }) => {
+                    return Err(SessionError::capture(
+                        SessionErrorKind::MoveDestinationParentNotGroup {
+                            to: to.clone(),
+                            parent,
+                        },
+                    ));
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    return Err(SessionError::capture(
+                        SessionErrorKind::MoveDestinationParentMissing {
+                            to: to.clone(),
+                            missing_parent: parent,
+                        },
+                    ));
+                }
+            }
+        }
 
         // Get updated subtree
         let subtree_data: Vec<(Path, NodeId, NodeType)> = updated_nodes(
@@ -1054,24 +1110,6 @@ impl Session {
         Err(SessionError::capture(SessionErrorKind::AncestorNodeNotFound {
             prefix: path.clone(),
         }))
-    }
-
-    #[instrument(skip(self))]
-    async fn check_all_ancestors_exist(&self, path: &Path) -> SessionResult<()> {
-        let mut ancestors = path.ancestors();
-        // the first element is the `path` itself, which we might be
-        // trying to create now; skip it.
-        let current_path = ancestors.next();
-        debug_assert_eq!(current_path.as_ref(), Some(path));
-        for parent in ancestors {
-            let node = self.get_node(&parent).await;
-            if node.is_err() {
-                return Err(SessionError::capture(
-                    SessionErrorKind::AncestorNodeNotFound { prefix: parent },
-                ));
-            }
-        }
-        Ok(())
     }
 
     #[instrument(skip(self))]
@@ -1392,6 +1430,19 @@ impl Session {
     }
 
     #[instrument(skip(self))]
+    /// Resolve a possibly-relative virtual chunk location to its absolute URL.
+    ///
+    /// `vcc://name/path` URLs are expanded against the session's registered
+    /// virtual chunk containers. Absolute URLs (`s3://`, `gs://`, `file://`, …)
+    /// are returned as-is.
+    pub fn resolve_virtual_location(
+        &self,
+        location: &VirtualChunkLocation,
+    ) -> Result<String, icechunk_format::manifest::VirtualReferenceError> {
+        self.virtual_resolver.expand_location(location.url())
+    }
+
+    #[instrument(skip(self))]
     pub async fn all_virtual_chunk_locations(
         &self,
     ) -> SessionResult<impl Stream<Item = SessionResult<String>> + '_> {
@@ -1454,7 +1505,7 @@ impl Session {
             }
             let new_snapshot_info = SnapshotInfo {
                 parent_id: Some(self.snapshot_id().clone()),
-                ..new_snap.as_ref().try_into().inject()?
+                ..SnapshotInfo::from_snapshot_file(new_snap.as_ref()).inject()?
             };
             Ok(Arc::new(
                 repo_info
@@ -1722,6 +1773,41 @@ impl Session {
         .await
     }
 
+    /// Apply one transaction log during a rebase: diff the current change set
+    /// against `previous_change` using `solver` (with `previous_repo` as the
+    /// read-only session it belongs to) and replace this session's change set
+    /// with the patched result. Does not advance `snapshot_id`; the caller does
+    /// that once a commit's whole chain of logs has been applied. Returns
+    /// `RebaseFailed` (tagged with `failed_snapshot`) if the conflicts can't be
+    /// resolved.
+    async fn rebase_one_log(
+        &mut self,
+        previous_change: &TransactionLog,
+        previous_repo: &Session,
+        solver: &(dyn ConflictSolver + Send + Sync),
+        failed_snapshot: &SnapshotId,
+    ) -> SessionResult<()> {
+        let mut fresh = self.change_set().fresh();
+        std::mem::swap(self.change_set_mut()?, &mut fresh);
+        let change_set = fresh;
+        // TODO: this should probably execute in a worker thread
+        match solver.solve(previous_change, previous_repo, change_set, self).await? {
+            ConflictResolution::Patched(patched_changeset) => {
+                trace!("Snapshot rebased");
+                self.change_set = patched_changeset;
+                Ok(())
+            }
+            ConflictResolution::Unsolvable { reason, unmodified } => {
+                warn!("Snapshot cannot be rebased. Aborting rebase.");
+                self.change_set = unmodified;
+                Err(SessionError::capture(SessionErrorKind::RebaseFailed {
+                    snapshot: failed_snapshot.clone(),
+                    conflicts: reason,
+                }))
+            }
+        }
+    }
+
     /// Detect and optionally fix conflicts between the current [`ChangeSet`] (or session) and
     /// the tip of the branch.
     ///
@@ -1796,9 +1882,18 @@ impl Session {
 
         debug!("Rebase started");
 
-        let new_commits = match self.spec_version() {
-            SpecVersionBin::V1 => self.commits_to_rebase_v1(branch_name.as_str()).await?,
-            SpecVersionBin::V2 => self.commits_to_rebase_v2(branch_name.as_str()).await?,
+        // A single repo info read serves both computing the commits to rebase
+        // over and resolving each commit's pruned-ancestor logs, so both see one
+        // consistent snapshot. V1 repos have no repo info / pruned-ancestor logs.
+        let (new_commits, repo_info) = match self.spec_version() {
+            SpecVersionBin::V1 => {
+                (self.commits_to_rebase_v1(branch_name.as_str()).await?, None)
+            }
+            SpecVersionBin::V2 => {
+                let (commits, repo_info) =
+                    self.commits_to_rebase_v2(branch_name.as_str()).await?;
+                (commits, Some(repo_info))
+            }
         };
 
         trace!("Found {} commits to rebase over", new_commits.len());
@@ -1827,25 +1922,44 @@ impl Session {
                 snap_id.clone(),
             );
 
-            let mut fresh = self.change_set().fresh();
-            std::mem::swap(self.change_set_mut()?, &mut fresh);
-            let change_set = fresh;
-            // TODO: this should probably execute in a worker thread
-            match solver.solve(&tx_log, &session, change_set, self).await? {
-                ConflictResolution::Patched(patched_changeset) => {
-                    trace!("Snapshot rebased");
-                    self.change_set = patched_changeset;
-                    self.snapshot_id = snap_id;
-                }
-                ConflictResolution::Unsolvable { reason, unmodified } => {
-                    warn!("Snapshot cannot be rebased. Aborting rebase.");
-                    self.change_set = unmodified;
-                    return Err(SessionError::capture(SessionErrorKind::RebaseFailed {
-                        snapshot: snap_id,
-                        conflicts: reason,
-                    }));
-                }
+            // Replay, oldest first, the transaction logs of ancestors that
+            // expiration pruned from under this commit, then the commit's own
+            // log. A missing pruned log would silently hide conflicts, so we abort the
+            // rebase rather than skip it. The previous_repo for the pruned logs
+            // is this commit's read-only session, as the pruned snapshots no
+            // longer exist.
+            let pruned_ids = match repo_info.as_ref() {
+                Some(ri) => ri.find_snapshot(&snap_id).inject()?.pruned_ancestor_tx_logs,
+                // V1 repos have no pruned-ancestor logs.
+                None => Vec::new(),
+            };
+            for pruned_id in &pruned_ids {
+                // FIXME: concurrency
+                let pruned_log =
+                    match self.asset_manager.fetch_transaction_log(pruned_id).await {
+                        Ok(log) => log,
+                        Err(e)
+                            if matches!(
+                                e.kind,
+                                RepositoryErrorKind::StorageError(
+                                    StorageErrorKind::ObjectNotFound
+                                )
+                            ) =>
+                        {
+                            return Err(SessionError::capture(
+                                SessionErrorKind::MissingPrunedAncestorTxLog {
+                                    snapshot: snap_id.clone(),
+                                    tx_log: pruned_id.clone(),
+                                },
+                            ));
+                        }
+                        Err(e) => return Err(e).inject(),
+                    };
+                self.rebase_one_log(&pruned_log, &session, solver, &snap_id).await?;
             }
+
+            self.rebase_one_log(&tx_log, &session, solver, &snap_id).await?;
+            self.snapshot_id = snap_id;
         }
         debug!("Rebase done");
         Ok(())
@@ -1904,11 +2018,11 @@ impl Session {
     async fn commits_to_rebase_v2(
         &self,
         branch_name: &str,
-    ) -> SessionResult<Vec<SnapshotId>> {
+    ) -> SessionResult<(Vec<SnapshotId>, Arc<RepoInfo>)> {
         let (latest_repo_info, _) =
             self.asset_manager.fetch_repo_info().await.inject()?;
 
-        match latest_repo_info.resolve_branch(branch_name) {
+        let commits = match latest_repo_info.resolve_branch(branch_name) {
             Err(IcechunkFormatError {
                 kind: IcechunkFormatErrorKind::BranchNotFound { .. },
                 ..
@@ -1919,16 +2033,16 @@ impl Session {
                     branch = &self.branch_name,
                     "No rebase is needed, the branch was deleted. Aborting rebase."
                 );
-                Ok(Vec::new())
+                Vec::new()
             }
-            Err(err) => Err(err.inject()),
+            Err(err) => return Err(err.inject()),
             Ok(current_snapshot_id) if current_snapshot_id == self.snapshot_id => {
                 // nothing to do, commit should work without rebasing
                 warn!(
                     branch = &self.branch_name,
                     "No rebase is needed, parent snapshot is at the top of the branch. Aborting rebase."
                 );
-                Ok(Vec::new())
+                Vec::new()
             }
             Ok(current_snapshot_id) => {
                 let ancestry = stream::iter(
@@ -1937,14 +2051,14 @@ impl Session {
                         .inject()?
                         .map_ok(|snap| snap.id),
                 );
-                let res = ancestry
+                ancestry
                     .try_take_while(|snap_id| ready(Ok(snap_id != &self.snapshot_id)))
                     .try_collect()
                     .await
-                    .inject()?;
-                Ok(res)
+                    .inject()?
             }
-        }
+        };
+        Ok((commits, latest_repo_info))
     }
 }
 
@@ -2608,7 +2722,7 @@ async fn flush_existing_node(
                     );
                     result.manifest_files.push(mf);
                 }
-                result.manifest_refs.extend(array_refs.into_iter());
+                result.manifest_refs.extend(array_refs);
                 Ok(Some(result))
             }
             NodeData::Group => Ok(None),
@@ -3197,7 +3311,14 @@ async fn do_commit_v2(
         debug!(branch_name, %new_snapshot_id, %parent_id, attempt, "Generating new repo info object");
         let new_snapshot_info = SnapshotInfo {
             parent_id: Some(parent_id.clone()),
-            ..new_snapshot.as_ref().try_into().inject()?
+            // Amend replaces parent_snapshot, so the new snapshot inherits any
+            // pruned-ancestor logs it carried (the chain is copied, not merged
+            // in). A brand-new commit has none.
+            pruned_ancestor_tx_logs: match commit_method {
+                CommitMethod::Amend => parent_snapshot.pruned_ancestor_tx_logs.clone(),
+                CommitMethod::NewCommit => Vec::new(),
+            },
+            ..SnapshotInfo::from_snapshot_file(new_snapshot.as_ref()).inject()?
         };
 
         let update_type = match commit_method {
@@ -3881,14 +4002,14 @@ mod tests {
         .await?;
         let repo_info = RepoInfo::initial(
             SpecVersionBin::current(),
-            (&initial).try_into()?,
+            SnapshotInfo::from_snapshot_file(&initial)?,
             100,
             None::<&()>,
             None,
         )
         .add_snapshot(
             SpecVersionBin::current(),
-            snapshot.as_ref().try_into()?,
+            SnapshotInfo::from_snapshot_file(snapshot.as_ref())?,
             Some("main"),
             UpdateType::NewCommitUpdate {
                 branch: "main".to_string(),
@@ -5078,8 +5199,62 @@ mod tests {
         let res = res.unwrap_err();
         assert!(matches!(res,
                 ICError { kind, ..} if matches!(&kind,
-                                                SessionErrorKind::AncestorNodeNotFound {prefix, ..}
-                                                if *prefix == "/b".try_into().unwrap())));
+                                                SessionErrorKind::MoveDestinationParentMissing {missing_parent, ..}
+                                                if *missing_parent == "/b".try_into().unwrap())));
+
+        Ok(())
+    }
+
+    #[tokio_test]
+    async fn move_into_self_or_descendant_is_rejected() -> Result<(), Box<dyn Error>> {
+        let repo = create_memory_store_repository(SpecVersionBin::current()).await;
+
+        let mut session = repo.writable_session("main").await?;
+        session.add_group(Path::root(), Bytes::copy_from_slice(b"")).await?;
+        session.add_group("/a".try_into().unwrap(), Bytes::copy_from_slice(b"")).await?;
+        session
+            .add_group("/a/b".try_into().unwrap(), Bytes::copy_from_slice(b""))
+            .await?;
+        session
+            .add_group("/a/b/c".try_into().unwrap(), Bytes::copy_from_slice(b""))
+            .await?;
+        session.commit("setup").max_concurrent_nodes(8).execute().await?;
+
+        // to == from
+        let mut rearrange = repo.rearrange_session("main").await?;
+        let res =
+            rearrange.move_node("/a".try_into().unwrap(), "/a".try_into().unwrap()).await;
+        assert!(matches!(
+            res,
+            Err(SessionError {
+                kind: SessionErrorKind::MoveIntoSelfOrDescendant { .. },
+                ..
+            })
+        ));
+
+        // to is a strict descendant of from
+        let res = rearrange
+            .move_node("/a".try_into().unwrap(), "/a/c".try_into().unwrap())
+            .await;
+        assert!(matches!(
+            res,
+            Err(SessionError {
+                kind: SessionErrorKind::MoveIntoSelfOrDescendant { .. },
+                ..
+            })
+        ));
+
+        // to is a deep descendant of from
+        let res = rearrange
+            .move_node("/a".try_into().unwrap(), "/a/b/c/d".try_into().unwrap())
+            .await;
+        assert!(matches!(
+            res,
+            Err(SessionError {
+                kind: SessionErrorKind::MoveIntoSelfOrDescendant { .. },
+                ..
+            })
+        ));
 
         Ok(())
     }
@@ -5549,14 +5724,15 @@ mod tests {
         session.add_group(Path::root(), Bytes::new()).await?;
         let apath: Path = "/foo/old/array".try_into()?;
         session.add_array(apath.clone(), shape, None, Bytes::new()).await?;
+        session.add_group("/foo/other".try_into()?, Bytes::new()).await?;
         session.commit("first commit").max_concurrent_nodes(8).execute().await?;
 
         let mut session = repo.rearrange_session("main").await?;
         assert!(matches!(
                 session
-                    .move_node(Path::new("/foo/old/array").unwrap(), Path::new("/foo/old/array").unwrap())
+                    .move_node(Path::new("/foo/old/array").unwrap(), Path::new("/foo/other").unwrap())
                     .await,
-                Err(SessionError{kind: SessionErrorKind::MoveWontOverwrite(s), ..}) if s == "/foo/old/array"
+                Err(SessionError{kind: SessionErrorKind::MoveWontOverwrite(s), ..}) if s == "/foo/other"
         ));
 
         assert!(matches!(

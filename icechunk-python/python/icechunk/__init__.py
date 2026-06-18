@@ -56,6 +56,7 @@ from icechunk.credentials import (
     GcsStaticCredentials,
     S3Credentials,
     S3StaticCredentials,
+    azure_anonymous_credentials,
     azure_credentials,
     azure_from_env_credentials,
     azure_refreshable_credentials,
@@ -82,6 +83,7 @@ from icechunk.snapshots import (
 )
 from icechunk.storage import (
     AnyObjectStoreConfig,
+    ChecksumAlgorithm,
     S3Options,
     Storage,
     StorageConcurrencySettings,
@@ -123,6 +125,7 @@ __all__ = [
     "AzureStaticCredentials",
     "BasicConflictSolver",
     "CachingConfig",
+    "ChecksumAlgorithm",
     "ChunkType",
     "CommitMethod",
     "CompressionAlgorithm",
@@ -174,6 +177,7 @@ __all__ = [
     "VirtualChunkContainer",
     "VirtualChunkSpec",
     "__version__",
+    "azure_anonymous_credentials",
     "azure_credentials",
     "azure_from_env_credentials",
     "azure_refreshable_credentials",
